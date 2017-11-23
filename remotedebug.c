@@ -8,7 +8,7 @@
 static int DEBUG_HOST = 0;	// host L in client VM
 static int DEBUG_CLIENT = 0;	// client L in host VM for hook
 
-static int DEBUG_HOOK = 0;	// hook function in client VM (void * in host VM)
+static int DEBUG_HOOK = 0;	// hook function(其实是一个 thread) in client VM (void * in host VM)
 
 static void
 clear_client(lua_State *L) {
@@ -36,6 +36,7 @@ lhost_clear(lua_State *L) {
 
 // 1. lightuserdata string_mainscript
 // 2. lightuserdata host_L
+// debuger 会在脚本中通过调用 sethook 来注册 hook 函数
 static int
 client_main(lua_State *L) {
 	luaL_openlibs(L);
@@ -72,6 +73,7 @@ lhost_start(lua_State *L) {
 	lua_pushlightuserdata(L, cL);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_CLIENT);
 
+	// 启动 debuger，debuger 是跑在另外一个 state 中的一个循环中( 通过thread运行 )
 	lua_pushcfunction(cL, client_main);
 	lua_pushlightuserdata(cL, (void *)mainscript);
 	lua_pushlightuserdata(cL, (void *)L);
@@ -115,7 +117,7 @@ lhost_probe(lua_State *L) {
 		lua_pushnil(cL);
 	}
 	lua_pushinteger(cL, ar.currentline);
-	lua_pushlightuserdata(cL, L);
+	lua_pushlightuserdata(cL, L);	// 主线程也装进去
 	if (lua_resume(cL, NULL, 3) == LUA_YIELD) {
 		return 0;
 	}
@@ -183,16 +185,20 @@ get_host(lua_State *L) {
 
 static int hook_loop_k(lua_State *L, int status, lua_KContext ctx);
 
+// original function
 static int
 hook_again_k(lua_State *L, int status, lua_KContext ctx) {
-	return lua_yieldk(L, 0, 0, hook_loop_k);	// resume hook_loop_k again
+	return lua_yieldk(L, 0, 0, hook_loop_k);	// resume hook_loop_k again, lua_yieldk 是 callee function
 }
 
+// 1. string
+// 2. currentline
+// 3. host L
 static int
 hook_loop_k(lua_State *L, int status, lua_KContext ctx) {
 	int currentline = lua_tointeger(L,2);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOST);	// set host L
-	lua_settop(L, 1);
+	lua_settop(L, 1);	// string
 	switch (lua_type(L, 1)) {
 	case LUA_TNUMBER:
 		switch(lua_tointeger(L, 1)) {
@@ -222,9 +228,10 @@ hook_loop_k(lua_State *L, int status, lua_KContext ctx) {
 		lua_pushnil(L);
 		break;
 	}
-	lua_pushvalue(L, lua_upvalueindex(1));
-	lua_replace(L, 1);
-	lua_pushinteger(L, currentline);
+	// string string
+	lua_pushvalue(L, lua_upvalueindex(1));	// string, string, hookfunc(sethook 传入的)
+	lua_replace(L, 1); // hookfunc, string
+	lua_pushinteger(L, currentline); // hook func, string, currentline
 	lua_callk(L, 2, 0, 0, hook_again_k);
 	return hook_again_k(L, 0, 0);
 }
@@ -237,12 +244,12 @@ hook_loop(lua_State *L) {
 
 static int
 lclient_sethook(lua_State *L) {
-	luaL_checktype(L,1,LUA_TFUNCTION);
-	lua_State *cL = lua_newthread(L);
-	lua_pushvalue(L, 1);
-	lua_pushcclosure(L, hook_loop, 1);
-	lua_xmove(L, cL, 1);
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOOK);
+	luaL_checktype(L,1,LUA_TFUNCTION);	// hookfunc
+	lua_State *cL = lua_newthread(L);	// hookfunc, cL					|
+	lua_pushvalue(L, 1);				// hookfunc, cL, hookfunc		|
+	lua_pushcclosure(L, hook_loop, 1);	// hookfunc, cL, hook_loop		|
+	lua_xmove(L, cL, 1);				// hookfunc, cL					| hook_loop
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOOK); // hookfunc			| hook_loop
 	return 0;
 }
 
