@@ -35,6 +35,14 @@
 #define VAR_METATABLE 8	// table.metatable
 #define VAR_USERVALUE 9	// userdata.uservalue
 
+/* host 的变量在 debuger 都是以 value 的形式来表示，每个 value 描述了如何定位 host 中的一个变量
+* 以上定位类型是否必要和完备呢？
+* FUNCLIST, 局部变量、全局变量、REGISTRY、Table[x]、Table.metatable、UpValue、userdata.uservalue、MAINTHREAD
+*
+* 如果变量是非引用类型可以直接 copy 到 debuger 中来，否则的话才需要用 value 来层层定位
+*
+* value 的 uservalue 怎么使用的?
+*/
 struct value {
 	uint8_t type;
 	uint16_t frame;
@@ -67,6 +75,7 @@ sizeof_value(struct value *v) {
 }
 
 // copy a value from -> to, return the lua type of copied or LUA_TNONE
+// 进行一个非引用 object 的 copy
 static int
 copy_value(lua_State *from, lua_State *to) {
 	int t = lua_type(from, -1);
@@ -99,7 +108,8 @@ copy_value(lua_State *from, lua_State *to) {
 	return t;
 }
 
-// L top : value, uservalue
+// L top : uservalue
+// return 类型，将 value 具体的值拷贝到 cL 去
 static int
 eval_value_(lua_State *L, lua_State *cL, struct value *v) {
 	if (lua_checkstack(cL, 3) == 0)
@@ -247,18 +257,19 @@ eval_value_(lua_State *L, lua_State *cL, struct value *v) {
 }
 
 // extract L top into cL, return the lua type or LUA_TNONE(failed)
+// extract 是可以解压到最底层，返回最终变量的类型
 static int
 eval_value(lua_State *L, lua_State *cL) {
 	if (lua_checkstack(cL, 1) == 0)
 		return luaL_error(L, "stack overflow");
-	int t = copy_value(L, cL);
+	int t = copy_value(L, cL);	// 非引用的可以直接 copy
 	if (t != LUA_TNONE) {
 		return t;
 	}
 	t = lua_type(L, -1);
-	if (t == LUA_TUSERDATA) {
+	if (t == LUA_TUSERDATA) {	// 引用类型只能通过层层定位到最终值
 		struct value *v = lua_touserdata(L, -1);
-		lua_getuservalue(L, -1);
+		lua_getuservalue(L, -1);	// 获得 userdata 关联的 uservalue
 		t = eval_value_(L, cL, v);
 		lua_pop(L, 1);	// pop uservalue
 		return t;
@@ -266,23 +277,27 @@ eval_value(lua_State *L, lua_State *cL) {
 	return LUA_TNONE;
 }
 
+// 从 cL 获得一个值写入 L, cL 通常是 host state，而 L 是 debuger 的
+// 一般是传入一个定位，将定位到的最终值写入
+// in value_addr, out value
 static void
 get_value(lua_State *L, lua_State *cL) {
-	if (eval_value(L, cL) == LUA_TNONE) {
+	if (eval_value(L, cL) == LUA_TNONE) {	// 先从 L 弄一个值过去缓存? a trick
 		lua_pop(L, 1);
 		lua_pushnil(L);
 		// failed
 		return;
 	}
-	lua_pop(L, 1);
-	if (copy_value(cL, L) == LUA_TNONE) {
+	lua_pop(L, 1);	// 已经 extract 过去了，本地无需再保存
+	if (copy_value(cL, L) == LUA_TNONE) {	// copy 回来
 		lua_pushfstring(L, "[%s: %p]", 
 			lua_typename(cL, lua_type(cL, -1)),
 			lua_topointer(cL, -1)
 			);
 	}
-	lua_pop(cL,1);
+	lua_pop(cL,1);	// host 弹出之前缓存的
 }
+
 
 static const char *
 get_type(lua_State *L, lua_State *cL) {
@@ -291,6 +306,7 @@ get_type(lua_State *L, lua_State *cL) {
 	return lua_typename(L, t);
 }
 
+/* 从 cL 获得一个 local 变量相关信息，将其存入一个 userdata 中，并压入 L */
 static const char *
 get_frame_local(lua_State *L, lua_State *cL, int frame, int index) {
 	lua_Debug ar;
@@ -510,7 +526,7 @@ get_upvalue(lua_State *L, lua_State *cL, int index) {
 		lua_pop(L, 1);
 		return NULL;
 	}
-	int t = eval_value(L, cL);
+	int t = eval_value(L, cL);	// 将 function 拷贝到 cL
 	if (t == LUA_TNONE) {
 		lua_pop(L, 1);	// remove function object
 		return NULL;
