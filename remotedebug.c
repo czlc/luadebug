@@ -262,6 +262,9 @@ lclient_sethook(lua_State *L) {
 	return 0;
 }
 
+// 1. opt value，存的是 hL 里面的某个线程，表示对哪个 hL 设置 mask
+// 2. string(c/r/l)
+// 3. count
 static int
 lclient_hookmask(lua_State *L) {
 	lua_State *hL = get_host(L);
@@ -346,6 +349,7 @@ lclient_getfunc(lua_State *L) {
 	return 0;
 }
 
+// 获得 table[key]
 static int
 lclient_index(lua_State *L) {
 	lua_State *hL = get_host(L);
@@ -379,6 +383,7 @@ lclient_next(lua_State *L) {
 	return 2;
 }
 
+/* 获得具体的值 */
 static int
 lclient_value(lua_State *L) {
 	lua_State *hL = get_host(L);
@@ -386,6 +391,7 @@ lclient_value(lua_State *L) {
 	return 1;
 }
 
+// arg: value
 static int
 lclient_type(lua_State *L) {
 	lua_State *hL = get_host(L);
@@ -394,6 +400,7 @@ lclient_type(lua_State *L) {
 	return 1;
 }
 
+// arg:f index, f 是以 userdata 的方式定位表示
 static int
 lclient_getupvalue(lua_State *L) {
 	int index = luaL_checkinteger(L, 2);
@@ -410,6 +417,7 @@ lclient_getupvalue(lua_State *L) {
 	return 0;
 }
 
+// arg: value
 static int
 lclient_getmetatable(lua_State *L) {
 	lua_settop(L, 1);

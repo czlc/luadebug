@@ -35,6 +35,16 @@
 #define VAR_METATABLE 8	// table.metatable
 #define VAR_USERVALUE 9	// userdata.uservalue
 
+/* host 的变量在 debuger 都是以 value 的形式来表示，每个 value 描述了如何定位 host 中的一个变量
+* 以上定位类型是否必要和完备呢？
+* FUNCLIST, 局部变量、全局变量、REGISTRY、Table[x]、Table.metatable、UpValue、userdata.uservalue、MAINTHREAD
+*
+* 如果变量是非引用类型可以直接 copy 到 debuger 中来，否则的话才需要用 value 来层层定位
+*
+* 需要一个变量更具体的信息，需要将 value 解压到原始 state 然后再分析
+*
+* value 的 uservalue 怎么使用的?
+*/
 struct value {
 	uint8_t type;
 	uint16_t frame;
@@ -42,6 +52,7 @@ struct value {
 };
 
 // return record number of value 
+// 表明定位到具体的值需要多少个 value
 static int
 sizeof_value(struct value *v) {
 	switch (v->type) {
@@ -52,9 +63,9 @@ sizeof_value(struct value *v) {
 	case VAR_MAINTHREAD:
 		return 1;
 	case VAR_INDEX_OBJ:
-		return 1 + v->index + sizeof_value(v+1+v->index);
+		return 1 + v->index + sizeof_value(v+1+v->index);	// ??
 	case VAR_METATABLE:
-		if (v->frame) {
+		if (v->frame == 1) {
 			return 1;
 		}
 		// go through
@@ -67,6 +78,8 @@ sizeof_value(struct value *v) {
 }
 
 // copy a value from -> to, return the lua type of copied or LUA_TNONE
+// 进行一个非引用 object 的 copy
+// +1
 static int
 copy_value(lua_State *from, lua_State *to) {
 	int t = lua_type(from, -1);
@@ -99,7 +112,8 @@ copy_value(lua_State *from, lua_State *to) {
 	return t;
 }
 
-// L top : value, uservalue
+// L top : uservalue
+// return 类型，将 value 具体的值拷贝到 cL 去
 static int
 eval_value_(lua_State *L, lua_State *cL, struct value *v) {
 	if (lua_checkstack(cL, 3) == 0)
@@ -247,18 +261,20 @@ eval_value_(lua_State *L, lua_State *cL, struct value *v) {
 }
 
 // extract L top into cL, return the lua type or LUA_TNONE(failed)
+// extract 是可以解压到最底层，返回最终变量的类型
+// 将一个 value 解压到它来源的 stack，这样可以方便遍历它
 static int
 eval_value(lua_State *L, lua_State *cL) {
 	if (lua_checkstack(cL, 1) == 0)
 		return luaL_error(L, "stack overflow");
-	int t = copy_value(L, cL);
+	int t = copy_value(L, cL);	// 非引用的可以直接 copy
 	if (t != LUA_TNONE) {
 		return t;
 	}
 	t = lua_type(L, -1);
-	if (t == LUA_TUSERDATA) {
+	if (t == LUA_TUSERDATA) {	// 引用类型只能通过层层定位到最终值
 		struct value *v = lua_touserdata(L, -1);
-		lua_getuservalue(L, -1);
+		lua_getuservalue(L, -1);	// 获得 userdata 关联的 uservalue
 		t = eval_value_(L, cL, v);
 		lua_pop(L, 1);	// pop uservalue
 		return t;
@@ -266,23 +282,27 @@ eval_value(lua_State *L, lua_State *cL) {
 	return LUA_TNONE;
 }
 
+// 从 cL 获得一个值写入 L, cL 通常是 host state，而 L 是 debuger 的
+// 一般是传入一个定位，将定位到的最终值写入
+// in value_addr, out value
 static void
 get_value(lua_State *L, lua_State *cL) {
-	if (eval_value(L, cL) == LUA_TNONE) {
+	if (eval_value(L, cL) == LUA_TNONE) {	// 先从 L 弄一个值过去缓存? a trick
 		lua_pop(L, 1);
 		lua_pushnil(L);
 		// failed
 		return;
 	}
-	lua_pop(L, 1);
-	if (copy_value(cL, L) == LUA_TNONE) {
+	lua_pop(L, 1);	// 已经 extract 过去了，本地无需再保存
+	if (copy_value(cL, L) == LUA_TNONE) {	// copy 回来
 		lua_pushfstring(L, "[%s: %p]", 
 			lua_typename(cL, lua_type(cL, -1)),
 			lua_topointer(cL, -1)
 			);
 	}
-	lua_pop(cL,1);
+	lua_pop(cL,1);	// host 弹出之前缓存的
 }
+
 
 static const char *
 get_type(lua_State *L, lua_State *cL) {
@@ -291,6 +311,7 @@ get_type(lua_State *L, lua_State *cL) {
 	return lua_typename(L, t);
 }
 
+/* 从 cL 获得一个 local 变量相关信息，将其存入一个 userdata 中，并压入 L */
 static const char *
 get_frame_local(lua_State *L, lua_State *cL, int frame, int index) {
 	lua_Debug ar;
@@ -336,22 +357,26 @@ get_frame_func(lua_State *L, lua_State *cL, int frame) {
 	return 1;
 }
 
+/* 将 index 所指的value 的 uservalue 拷贝到 top 上的 v 的 uservalue*/
+// 不改变栈大小
+// value(top)
 static void
 copy_table(lua_State *L, int index) {
-	if (lua_getuservalue(L, index) == LUA_TTABLE) {
+	if (lua_getuservalue(L, index) == LUA_TTABLE) { // value, uservalue
 		int n = lua_rawlen(L, -1);
-		lua_createtable(L, n, 0);
+		lua_createtable(L, n, 0);	// value, uservalue, table
 		// v, ut, []
 		int i;
 		for (i=1;i<=n;i++) {
-			lua_rawgeti(L, -2, i);
-			lua_rawseti(L, -2, i);
+			lua_rawgeti(L, -2, i);	// value, uservalue, table, uservalue[i]
+			lua_rawseti(L, -2, i);	// value, uservalue, table
 		}
-		lua_setuservalue(L, -3);
+		lua_setuservalue(L, -3);	// value, uservalue
 	}
-	lua_pop(L, 1);
+	lua_pop(L, 1); // value
 }
 
+// table(v) 的 uservalue 用来定位其下item的，它是 key 的集合
 // table key
 static void
 new_index(lua_State *L, int type) {
@@ -360,7 +385,9 @@ new_index(lua_State *L, int type) {
 	struct value *v = lua_newuserdata(L, sizeof(struct value) * (sz + 1));
 	v->type = VAR_INDEX;
 	v->frame = type;
-	memcpy(v+1,t,sz * sizeof(struct value));
+	memcpy(v+1,t,sz * sizeof(struct value));	// value 放了 table的定位，因为只有找到table才能找到它
+
+	// 然后看在 table 中怎么找到自己
 	// t k v
 	copy_table(L, -3);	// copy uservalue from t to v
 	if (lua_isnil(L, -2)) {
@@ -368,8 +395,8 @@ new_index(lua_State *L, int type) {
 		v->index = 0;
 	} else {
 		if (lua_getuservalue(L, -3) != LUA_TTABLE) {
-			lua_pop(L, 1);
-			lua_createtable(L, 1, 0);
+			lua_pop(L, 1);	// t, k, v
+			lua_createtable(L, 1, 0);	// t, k, v, []
 		}
 		// t k v []
 		int n = lua_rawlen(L, -1);
@@ -377,11 +404,16 @@ new_index(lua_State *L, int type) {
 		// t k v [] k
 		lua_rawseti(L, -2, n+1);
 		// t k v [... k]
-		lua_setuservalue(L, -2);
-		v->index = n+1;
+		lua_setuservalue(L, -2);	// v.uservalue = [...k]
+		v->index = n+1;	// v 的 k 在uservalue 的位置
+		// 由此看出对于 key 是基本对象的 table[key]，它的定位方式是:
+		// v.uservalue 保存了一个 key 的 array, 这个 array 和 table 关联的
+		// 通过 v.index 可以访问到这个 key
+		// t k v
 	}
 }
 
+// 不改变栈大小
 static int
 append_table(lua_State *L, int index) {
 	if (lua_getuservalue(L, index) != LUA_TTABLE) {
@@ -399,17 +431,20 @@ append_table(lua_State *L, int index) {
 	int offset = lua_rawlen(L, -1);
 	int i;
 	for (i=1;;i++) {
-		if (lua_rawgeti(L, -2, i) == LUA_TNIL) {
+		if (lua_rawgeti(L, -2, i) == LUA_TNIL) {	// from[i]
 			// ..., v, [], [] , nil
 			break;
 		}
-		lua_rawseti(L, -2, i + offset);
+		lua_rawseti(L, -2, i + offset);	// ..., v, [], []
 	}
 	lua_pop(L, 3);
 	return offset;
 }
 
-// table key
+// table key(top)
+// 1. 定位到 table
+// 2. 定位到 key
+// 3. 从 table 中根据 key 定位到 value
 static void
 new_index_object(lua_State *L, int type) {
 	struct value *t = lua_touserdata(L, -2);
@@ -420,38 +455,45 @@ new_index_object(lua_State *L, int type) {
 	struct value *v = lua_newuserdata(L, sizeof(struct value) * (ts + ks + 1));
 	v->type = VAR_INDEX_OBJ;
 	v->frame = type;
-	v->index = ts;
+	v->index = ts;	// 多少个步骤才定位到所在的table
+
+	// step1
 	memcpy(v+1,t,ts * sizeof(struct value));
-	// t k v
-	copy_table(L, -3);	// copy uservalue from t to v
+
+	// t k v step3.1
+	copy_table(L, -3);	// copy uservalue from t to v, table 的查找表
+
+	// step2
 	memcpy(v+1+ts,k,ks * sizeof(struct value));
-	int offset = append_table(L, -2);	// move uservalue from k to v
+
+	// step3.2
+	int offset = append_table(L, -2);	// move uservalue from k to v, key 的查找表
 	if (offset) {
 		int i;
-		v = v+1+ts;
+		v = v+1+ts;	// k start
 		for (i=0;i<ks;i++,v++) {
 			if (v->type == VAR_INDEX && v->index != 0) {
-				v->index += offset;
+				v->index += offset;	// k 在表中的位置
 			}
 		}
 	}
 }
 
-// table key
+// L: table key(top)
 static int
 table_key(lua_State *L, lua_State *cL) {
 	if (lua_checkstack(cL, 3) == 0) {
 		return luaL_error(L, "stack overflow");
 	}
-	lua_insert(L, -2);	// L : key table
-	int t = eval_value(L, cL);
+	lua_insert(L, -2);	// L : key table (top)
+	int t = eval_value(L, cL);	// table 放到对面去
 	if (t != LUA_TTABLE) {
 		lua_pop(cL, 1);	// pop table
 		lua_pop(L, 2);	// pop k/t
 		return 0;
 	}
-	lua_insert(L, -2);	// L : table key
-	if (eval_value(L, cL) == LUA_TNONE) {	// key
+	lua_insert(L, -2);	// L : table key (top)
+	if (eval_value(L, cL) == LUA_TNONE) {	// key 也放到对面
 		lua_pop(cL, 1);	// pop table
 		lua_pop(L, 2);	// pop k/t
 		return 0;
@@ -459,13 +501,14 @@ table_key(lua_State *L, lua_State *cL) {
 	return 1;
 }
 
+// L: table, key(top)	cL:table value (top)
 static void
 combine_tk(lua_State *L, lua_State *cL, int type) {
-	if (copy_value(cL, L) != LUA_TNONE) {
-		lua_pop(cL, 2);
+	if (copy_value(cL, L) != LUA_TNONE) { // 非引用类型，直接将 value 考到 L L: t, k, v
+		lua_pop(cL, 2);		// cL: L: t, k, v
 		// L : t, k, v
-		lua_replace(L, -3);
-		lua_pop(L, 1);
+		lua_replace(L, -3);	// L: v, k
+		lua_pop(L, 1); // v
 		return;
 	}
 	lua_pop(cL, 2);	// pop t v from cL
@@ -477,15 +520,16 @@ combine_tk(lua_State *L, lua_State *cL, int type) {
 		new_index(L, type);
 	}
 	// L : t, k, v
-	lua_replace(L, -3);
-	lua_pop(L, 1);
+	lua_replace(L, -3);	// v,k
+	lua_pop(L, 1); // v
 }
 
+// table, key(top)
 static int
 get_index(lua_State *L, lua_State *cL) {
 	if (table_key(L, cL) == 0)
 		return 0;
-	lua_rawget(cL, -2);	// cL : table value
+	lua_rawget(cL, -2);	// cL : table value(top)
 	combine_tk(L, cL, 0);
 	return 1;
 }
@@ -504,33 +548,35 @@ next_key(lua_State *L, lua_State *cL) {
 	return 1;
 }
 
+// stack: function (value)
 static const char *
 get_upvalue(lua_State *L, lua_State *cL, int index) {
-	if (lua_type(L, -1) != LUA_TUSERDATA) {
+	if (lua_type(L, -1) != LUA_TUSERDATA) {	// func 是以 value 的方式表示
 		lua_pop(L, 1);
 		return NULL;
 	}
-	int t = eval_value(L, cL);
-	if (t == LUA_TNONE) {
+	int t = eval_value(L, cL);	// 将 function 拷贝到 cL
+	if (t == LUA_TNONE) {	// copy 失败
 		lua_pop(L, 1);	// remove function object
 		return NULL;
 	}
-	if (t != LUA_TFUNCTION) {
+	if (t != LUA_TFUNCTION) {	// copy 的不是 function
 		lua_pop(L, 1);	// remove function object
 		lua_pop(cL, 1);	// remove none function
 		return NULL;
 	}
-	const char *name = lua_getupvalue(cL, -1, index);
+	const char *name = lua_getupvalue(cL, -1, index);	// 在原始 state 获得upvalue相关信息
 	if (name == NULL) {
 		lua_pop(L, 1);	// remove function object
 		lua_pop(cL, 1);	// remove function
 		return NULL;
 	}
-	if (copy_value(cL, L) != LUA_TNONE) {
+	if (copy_value(cL, L) != LUA_TNONE) {	// 将 upvalue 拷回
 		lua_replace(L, -2);	// remove function object
 		lua_pop(cL, 1);
 		return name;
 	}
+	// 运行到这里表示 upvalue 是复杂类型，只能一层一层取
 	lua_pop(cL, 2);	// remove func / upvalue
 	struct value *f = lua_touserdata(L, -1);
 	int sz = sizeof_value(f);
@@ -538,8 +584,8 @@ get_upvalue(lua_State *L, lua_State *cL, int index) {
 	v->type = VAR_UPVALUE;
 	v->frame = 0;
 	v->index = index;
-	memcpy(v+1, f, sizeof(struct value) * sz);
-	copy_table(L, -2);
+	memcpy(v+1, f, sizeof(struct value) * sz);	// 函数也要带上 f, v
+	copy_table(L, -2);	// 将vf的uservalue 拷贝到新的 v上
 	lua_replace(L, -2);	// remove function object
 	return name;
 }
@@ -561,16 +607,17 @@ get_registry(lua_State *L, int type) {
 	return v;
 }
 
+// value
 static struct value *
 get_metatable(lua_State *L, lua_State *cL) {
 	if (lua_checkstack(cL, 2)==0)
 		luaL_error(L, "stack overflow");
-	int t = eval_value(L, cL);
+	int t = eval_value(L, cL);	// cL: value
 	if (t == LUA_TNONE) {
 		lua_pop(L, 1);
 		return NULL;
 	}
-	if (lua_getmetatable(cL,-1) == 0) {
+	if (lua_getmetatable(cL,-1) == 0) {	// cL:value, mt
 		lua_pop(L, 1);
 		lua_pop(cL, 1);
 		return NULL;
@@ -581,7 +628,7 @@ get_metatable(lua_State *L, lua_State *cL) {
 		int sz = sizeof_value(t);
 		struct value *v = lua_newuserdata(L, sizeof(struct value) * (sz + 1));
 		v->type = VAR_METATABLE;
-		v->frame = 0;
+		v->frame = 0;	// table 或者 userdata
 		v->index = 0;
 		memcpy(v+1,t,sz * sizeof(struct value));
 		// t v
