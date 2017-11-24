@@ -1,3 +1,10 @@
+/*
+* 设计意图：
+* 另外启动一个新的 lua 状态机来运行 debuger，试图不干扰 game 的状态
+* 通过在 host 添加 probe 来返回到 debuger，此时 host 会被 yiled 住，即使没有 yiled 也不能执行，因为他们在一个线程中，只能有一个在跑
+* debuger 可以取得 host 的当前状态信息
+* host 是游戏逻辑的某个 thread，初始化和每次 probe 都会更改
+*/
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
@@ -41,7 +48,7 @@ static int
 client_main(lua_State *L) {
 	luaL_openlibs(L);
 	lua_pushvalue(L, 2);
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOST);	// set host L
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOST);	// debuger state 记录 host state
 
 	if (lua_getglobal(L, "require") != LUA_TFUNCTION) {
 		return luaL_error(L, "No require api");
@@ -63,15 +70,16 @@ push_errmsg(lua_State *L, lua_State *cL) {
 	}
 }
 
+/* host 启动 */
 static int
 lhost_start(lua_State *L) {
 	clear_client(L);
-	const char * mainscript = luaL_checkstring(L, 1);
-	lua_State *cL = luaL_newstate();
+	const char * mainscript = luaL_checkstring(L, 1);	// debuger 的启动脚本
+	lua_State *cL = luaL_newstate();	// debuger 所在的state
 	if (cL == NULL)
 		return luaL_error(L, "Can't new debug client");
 	lua_pushlightuserdata(L, cL);
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_CLIENT);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_CLIENT);	// host state 记下 debuger state
 
 	// 启动 debuger，debuger 是跑在另外一个 state 中的一个循环中( 通过thread运行 )
 	lua_pushcfunction(cL, client_main);
@@ -106,18 +114,18 @@ lhost_probe(lua_State *L) {
 		return 0;
 	}
 	lua_Debug ar;
-	if (lua_getstack(L, 1, &ar) == 0 || lua_getinfo(L, "l", &ar) == 0) {
+	if (lua_getstack(L, 1, &ar) == 0 || lua_getinfo(L, "l", &ar) == 0) {	// 需要知道此时 host 运行到什么位置
 		return 0;
 	}
-	lua_State *cL = lua_touserdata(L, -1);
-	if (lua_type(L, 1) == LUA_TSTRING) {
+	lua_State *cL = lua_touserdata(L, -1);	// hook
+	if (lua_type(L, 1) == LUA_TSTRING) {	// 这个字符串没有逻辑意义？
 		const char * p = lua_tostring(L, 1);
 		lua_pushlightuserdata(cL, (void *)p);
 	} else {
 		lua_pushnil(cL);
 	}
 	lua_pushinteger(cL, ar.currentline);
-	lua_pushlightuserdata(cL, L);	// 主线程也装进去
+	lua_pushlightuserdata(cL, L);	// host也装进去
 	if (lua_resume(cL, NULL, 3) == LUA_YIELD) {
 		return 0;
 	}
@@ -191,14 +199,14 @@ hook_again_k(lua_State *L, int status, lua_KContext ctx) {
 	return lua_yieldk(L, 0, 0, hook_loop_k);	// resume hook_loop_k again, lua_yieldk 是 callee function
 }
 
-// 1. string
+// 1. event
 // 2. currentline
 // 3. host L
 static int
 hook_loop_k(lua_State *L, int status, lua_KContext ctx) {
 	int currentline = lua_tointeger(L,2);
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &DEBUG_HOST);	// set host L
-	lua_settop(L, 1);	// string
+	lua_settop(L, 1);	// event
 	switch (lua_type(L, 1)) {
 	case LUA_TNUMBER:
 		switch(lua_tointeger(L, 1)) {
@@ -221,18 +229,18 @@ hook_loop_k(lua_State *L, int status, lua_KContext ctx) {
 				return luaL_error(L, "Unkown hook event %d", (int)lua_tointeger(L, 1));
 		}
 		break;
-	case LUA_TLIGHTUSERDATA:	// string
+	case LUA_TLIGHTUSERDATA:
 		lua_pushstring(L, (const char *)lua_touserdata(L, 1));
 		break;
 	default:
 		lua_pushnil(L);
 		break;
 	}
-	// string string
-	lua_pushvalue(L, lua_upvalueindex(1));	// string, string, hookfunc(sethook 传入的)
-	lua_replace(L, 1); // hookfunc, string
-	lua_pushinteger(L, currentline); // hook func, string, currentline
-	lua_callk(L, 2, 0, 0, hook_again_k);
+	// event strevent
+	lua_pushvalue(L, lua_upvalueindex(1));	// event, strevent, hookfunc(sethook 传入的第一个参数)
+	lua_replace(L, 1); // hookfunc, strevent
+	lua_pushinteger(L, currentline); // hookfunc, strevent, currentline
+	lua_callk(L, 2, 0, 0, hook_again_k);	// 调用 hookfunc(strevent, currentline)
 	return hook_again_k(L, 0, 0);
 }
 
@@ -242,6 +250,7 @@ hook_loop(lua_State *L) {
 	return 0;
 }
 
+/* debuger 启动一个 thread, 用来执行 hook， host 一旦执行到 probe 就会回调过来 */
 static int
 lclient_sethook(lua_State *L) {
 	luaL_checktype(L,1,LUA_TFUNCTION);	// hookfunc
